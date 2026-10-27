@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.workshop</groupId>
+    <artifactId>orders-api</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>orders-api</name>
+    <description>Serverless Order Management API (AWS Lambda + Amazon API Gateway)</description>
+
+    <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <aws-lambda-java-core.version>1.2.3</aws-lambda-java-core.version>
+        <aws-lambda-java-events.version>3.14.0</aws-lambda-java-events.version>
+        <aws-lambda-java-serialization.version>1.1.5</aws-lambda-java-serialization.version>
+        <jackson.version>2.17.2</jackson.version>
+        <junit.version>5.10.3</junit.version>
+        <archunit.version>1.3.0</archunit.version>
+    </properties>
+
+    <dependencies>
+        <!-- Only the lambda.* packages may use these (enforced by ArchitectureTest). -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-core</artifactId>
+            <version>${aws-lambda-java-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-events</artifactId>
+            <version>${aws-lambda-java-events.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <!-- Test only -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- The same serializer the Lambda Java runtime uses; lets us verify JSON <-> POJO mapping locally. -->
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-serialization</artifactId>
+            <version>${aws-lambda-java-serialization.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>
+            <version>${archunit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Renders the API Gateway mapping templates (VTL) locally; see MappingTemplateTest -->
+            <groupId>org.apache.velocity</groupId>
+            <artifactId>velocity</artifactId>
+            <version>1.7</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+            <version>${jackson.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Silences ArchUnit's "no SLF4J provider" warning during mvn test -->
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-nop</artifactId>
+            <version>2.0.13</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Stable artifact name: infra/template.yaml points at target/orders-api.jar -->
+        <finalName>orders-api</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+            <plugin>
+                <!-- Lambda needs a single JAR with all runtime dependencies inside. -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <configuration>
+                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                    <filters>
+                        <filter>
+                            <artifact>*:*</artifact>
+                            <excludes>
+                                <exclude>META-INF/*.SF</exclude>
+                                <exclude>META-INF/*.DSA</exclude>
+                                <exclude>META-INF/*.RSA</exclude>
+                                <exclude>META-INF/versions/*/module-info.class</exclude>
+                                <exclude>module-info.class</exclude>
+                            </excludes>
+                        </filter>
+                    </filters>
+                </configuration>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

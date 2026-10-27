@@ -1,0 +1,421 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Orders API workshop. Deploys the same JAR behind two REST APIs:
+  Architecture A (non-proxy integration + mapping templates, one Lambda per operation) and
+  Architecture B (Lambda proxy integration, one Lambda with an HTTP adapter).
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Shared
+  # ---------------------------------------------------------------------------
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ---------------------------------------------------------------------------
+  # Architecture A: one function per operation, typed POJO input/output
+  # ---------------------------------------------------------------------------
+
+  CreateOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-create-order
+      Runtime: java17
+      Handler: com.workshop.orders.lambda.direct.CreateOrderFunction::handleRequest
+      Code: ../target/orders-api.jar
+      MemorySize: 512
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  GetOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-get-order
+      Runtime: java17
+      Handler: com.workshop.orders.lambda.direct.GetOrderFunction::handleRequest
+      Code: ../target/orders-api.jar
+      MemorySize: 512
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  FindOrdersByCustomerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-find-orders-by-customer
+      Runtime: java17
+      Handler: com.workshop.orders.lambda.direct.FindOrdersByCustomerFunction::handleRequest
+      Code: ../target/orders-api.jar
+      MemorySize: 512
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  DeleteOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-delete-order
+      Runtime: java17
+      Handler: com.workshop.orders.lambda.direct.DeleteOrderFunction::handleRequest
+      Code: ../target/orders-api.jar
+      MemorySize: 512
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  MappingApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-mapping
+      Description: "Architecture A: API Gateway extracts parameters, builds the Lambda input and maps errors to status codes."
+      EndpointConfiguration: { Types: [REGIONAL] }
+      Body:
+        swagger: "2.0"
+        info: { title: orders-api-mapping, version: "1.0" }
+        schemes: [https]
+        consumes: [application/json]
+        produces: [application/json]
+
+        # Only checks the *shape* of the POST body (valid JSON object, correct types) so malformed
+        # input never reaches Java. Business rules (required, quantity > 0) stay in OrderService.
+        x-amazon-apigateway-request-validators:
+          body-shape:
+            validateRequestBody: true
+            validateRequestParameters: false
+
+        x-amazon-apigateway-gateway-responses:
+          BAD_REQUEST_BODY:
+            statusCode: 400
+            responseTemplates:
+              application/json: '{"error": "INVALID_REQUEST", "message": "request body must be a JSON object with customerId (string), product (string) and quantity (integer)"}'
+          MISSING_AUTHENTICATION_TOKEN:
+            statusCode: 404
+            responseTemplates:
+              application/json: '{"error": "ROUTE_NOT_FOUND", "message": "No such resource or method"}'
+          DEFAULT_4XX:
+            responseTemplates:
+              application/json: '{"error": "$context.error.responseType", "message": $context.error.messageString}'
+          DEFAULT_5XX:
+            responseTemplates:
+              application/json: '{"error": "INTERNAL_ERROR", "message": $context.error.messageString}'
+
+        definitions:
+          CreateOrderRequest:
+            type: object
+            properties:
+              customerId: { type: string }
+              product: { type: string }
+              quantity: { type: integer }
+          Order:
+            type: object
+            properties:
+              id: { type: string }
+              customerId: { type: string }
+              product: { type: string }
+              quantity: { type: integer }
+          Orders:
+            type: array
+            items: { $ref: "#/definitions/Order" }
+          Error:
+            type: object
+            properties:
+              error: { type: string }
+              message: { type: string }
+
+        paths:
+          /orders:
+            post:
+              x-amazon-apigateway-request-validator: body-shape
+              parameters:
+                - in: body
+                  name: CreateOrderRequest
+                  required: true
+                  schema: { $ref: "#/definitions/CreateOrderRequest" }
+              responses:
+                "201":
+                  description: Created
+                  schema: { $ref: "#/definitions/Order" }
+                  headers:
+                    Location: { type: string }
+                "400": { description: Invalid request, schema: { $ref: "#/definitions/Error" } }
+                "500": { description: Unexpected error, schema: { $ref: "#/definitions/Error" } }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateOrderFunction.Arn}/invocations
+                passthroughBehavior: never
+                requestTemplates:
+                  # The body already has the shape of CreateOrderRequest: pass it through.
+                  application/json: "$input.json('$')"
+                responses:
+                  default:
+                    statusCode: "201"
+                    responseTemplates:
+                      application/json: |
+                        #set($context.responseOverride.header.Location = "$context.path/$input.path('$.id')")
+                        $input.json('$')
+                  '^INVALID_REQUEST: [\s\S]*':
+                    statusCode: "400"
+                    responseTemplates:
+                      application/json: |
+                        #set($message = $input.path('$.errorMessage').replaceFirst('^INVALID_REQUEST: ', ''))
+                        {"error": "INVALID_REQUEST", "message": "$util.escapeJavaScript($message).replaceAll("\\'", "'")"}
+                  '^(?!INVALID_REQUEST: |ORDER_NOT_FOUND: )[\s\S]+':
+                    statusCode: "500"
+                    responseTemplates:
+                      application/json: |
+                        {"error": "INTERNAL_ERROR", "message": "Unexpected error. Reference: $context.requestId"}
+
+            get:
+              parameters:
+                - { name: customerId, in: query, required: false, type: string }
+              responses:
+                "200": { description: Orders of the customer, schema: { $ref: "#/definitions/Orders" } }
+                "400": { description: Invalid request, schema: { $ref: "#/definitions/Error" } }
+                "500": { description: Unexpected error, schema: { $ref: "#/definitions/Error" } }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FindOrdersByCustomerFunction.Arn}/invocations
+                passthroughBehavior: never
+                requestTemplates:
+                  # A missing parameter becomes "" and is rejected by OrderService (400), keeping
+                  # the "customerId is required" rule in one place.
+                  application/json: |
+                    #set($customerId = $input.params().querystring.get('customerId'))
+                    #if(!$customerId) #set($customerId = "") #end
+                    {"customerId": "$util.escapeJavaScript($customerId).replaceAll("\\'", "'")"}
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: "$input.json('$')"
+                  '^INVALID_REQUEST: [\s\S]*':
+                    statusCode: "400"
+                    responseTemplates:
+                      application/json: |
+                        #set($message = $input.path('$.errorMessage').replaceFirst('^INVALID_REQUEST: ', ''))
+                        {"error": "INVALID_REQUEST", "message": "$util.escapeJavaScript($message).replaceAll("\\'", "'")"}
+                  '^(?!INVALID_REQUEST: |ORDER_NOT_FOUND: )[\s\S]+':
+                    statusCode: "500"
+                    responseTemplates:
+                      application/json: |
+                        {"error": "INTERNAL_ERROR", "message": "Unexpected error. Reference: $context.requestId"}
+
+          /orders/{id}:
+            get:
+              parameters:
+                - { name: id, in: path, required: true, type: string }
+              responses:
+                "200": { description: The order, schema: { $ref: "#/definitions/Order" } }
+                "400": { description: Invalid request, schema: { $ref: "#/definitions/Error" } }
+                "404": { description: Order not found, schema: { $ref: "#/definitions/Error" } }
+                "500": { description: Unexpected error, schema: { $ref: "#/definitions/Error" } }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetOrderFunction.Arn}/invocations
+                passthroughBehavior: never
+                requestTemplates:
+                  # GET /orders/ORD-42  ->  {"id": "ORD-42"}
+                  application/json: |
+                    {"id": "$util.escapeJavaScript($input.params().path.get('id')).replaceAll("\\'", "'")"}
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: "$input.json('$')"
+                  '^INVALID_REQUEST: [\s\S]*':
+                    statusCode: "400"
+                    responseTemplates:
+                      application/json: |
+                        #set($message = $input.path('$.errorMessage').replaceFirst('^INVALID_REQUEST: ', ''))
+                        {"error": "INVALID_REQUEST", "message": "$util.escapeJavaScript($message).replaceAll("\\'", "'")"}
+                  '^ORDER_NOT_FOUND: [\s\S]*':
+                    statusCode: "404"
+                    responseTemplates:
+                      application/json: |
+                        #set($message = $input.path('$.errorMessage').replaceFirst('^ORDER_NOT_FOUND: ', ''))
+                        {"error": "ORDER_NOT_FOUND", "message": "$util.escapeJavaScript($message).replaceAll("\\'", "'")"}
+                  '^(?!INVALID_REQUEST: |ORDER_NOT_FOUND: )[\s\S]+':
+                    statusCode: "500"
+                    responseTemplates:
+                      application/json: |
+                        {"error": "INTERNAL_ERROR", "message": "Unexpected error. Reference: $context.requestId"}
+
+            delete:
+              parameters:
+                - { name: id, in: path, required: true, type: string }
+              responses:
+                "204": { description: Deleted }
+                "400": { description: Invalid request, schema: { $ref: "#/definitions/Error" } }
+                "404": { description: Order not found, schema: { $ref: "#/definitions/Error" } }
+                "500": { description: Unexpected error, schema: { $ref: "#/definitions/Error" } }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteOrderFunction.Arn}/invocations
+                passthroughBehavior: never
+                requestTemplates:
+                  # DELETE /orders/ORD-42  ->  {"id": "ORD-42"}  (same input type as GET)
+                  application/json: |
+                    {"id": "$util.escapeJavaScript($input.params().path.get('id')).replaceAll("\\'", "'")"}
+                responses:
+                  default:
+                    statusCode: "204"
+                    responseTemplates:
+                      # The function returns null; a 204 must not carry a body.
+                      application/json: "## no body"
+                  '^INVALID_REQUEST: [\s\S]*':
+                    statusCode: "400"
+                    responseTemplates:
+                      application/json: |
+                        #set($message = $input.path('$.errorMessage').replaceFirst('^INVALID_REQUEST: ', ''))
+                        {"error": "INVALID_REQUEST", "message": "$util.escapeJavaScript($message).replaceAll("\\'", "'")"}
+                  '^ORDER_NOT_FOUND: [\s\S]*':
+                    statusCode: "404"
+                    responseTemplates:
+                      application/json: |
+                        #set($message = $input.path('$.errorMessage').replaceFirst('^ORDER_NOT_FOUND: ', ''))
+                        {"error": "ORDER_NOT_FOUND", "message": "$util.escapeJavaScript($message).replaceAll("\\'", "'")"}
+                  '^(?!INVALID_REQUEST: |ORDER_NOT_FOUND: )[\s\S]+':
+                    statusCode: "500"
+                    responseTemplates:
+                      application/json: |
+                        {"error": "INTERNAL_ERROR", "message": "Unexpected error. Reference: $context.requestId"}
+
+  MappingApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref MappingApi
+      StageName: !Ref StageName
+
+  CreateOrderInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateOrderFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MappingApi}/*/POST/orders
+
+  GetOrderInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetOrderFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MappingApi}/*/GET/orders/*
+
+  FindOrdersByCustomerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FindOrdersByCustomerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MappingApi}/*/GET/orders
+
+  DeleteOrderInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DeleteOrderFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MappingApi}/*/DELETE/orders/*
+
+  # ---------------------------------------------------------------------------
+  # Architecture B: one function, Lambda proxy integration, HTTP adapter in Java
+  # ---------------------------------------------------------------------------
+
+  OrdersApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-proxy
+      Runtime: java17
+      Handler: com.workshop.orders.lambda.proxy.OrdersApiHandler::handleRequest
+      Code: ../target/orders-api.jar
+      MemorySize: 512
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          # Set to "true" to print every incoming proxy event to CloudWatch Logs.
+          LOG_EVENTS: "false"
+
+  ProxyApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-proxy
+      Description: "Architecture B: API Gateway forwards the whole HTTP request; the Java HTTP adapter does the rest."
+      EndpointConfiguration: { Types: [REGIONAL] }
+      Body:
+        swagger: "2.0"
+        info: { title: orders-api-proxy, version: "1.0" }
+        schemes: [https]
+        x-amazon-apigateway-gateway-responses:
+          MISSING_AUTHENTICATION_TOKEN:
+            statusCode: 404
+            responseTemplates:
+              application/json: '{"error": "ROUTE_NOT_FOUND", "message": "No such resource"}'
+          DEFAULT_5XX:
+            responseTemplates:
+              application/json: '{"error": "INTERNAL_ERROR", "message": $context.error.messageString}'
+        paths:
+          # ANY: every method reaches the adapter, which answers 405 for unsupported ones.
+          /orders:
+            x-amazon-apigateway-any-method:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrdersApiFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+          /orders/{id}:
+            x-amazon-apigateway-any-method:
+              parameters:
+                - { name: id, in: path, required: true, type: string }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrdersApiFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+
+  ProxyApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ProxyApi
+      StageName: !Ref StageName
+
+  OrdersApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrdersApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ProxyApi}/*/*/*
+
+Outputs:
+  MappingApiUrl:
+    Description: Base URL of Architecture A (mapping templates)
+    Value: !Sub https://${MappingApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  ProxyApiUrl:
+    Description: Base URL of Architecture B (Lambda proxy)
+    Value: !Sub https://${ProxyApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  MappingApiId:
+    Value: !Ref MappingApi
+  ProxyApiId:
+    Value: !Ref ProxyApi
+  CreateOrderFunctionName:
+    Value: !Ref CreateOrderFunction
+  ProxyFunctionName:
+    Value: !Ref OrdersApiFunction
